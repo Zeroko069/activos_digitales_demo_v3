@@ -1,0 +1,263 @@
+/* =========================================================
+   TARJETAS DESPLEGABLES PARA CUENTAS, NOVEDADES Y BACKUPS
+   ========================================================= */
+
+.module-list {
+    display: grid;
+    gap: 14px;
+}
+
+.module-item {
+    overflow: hidden;
+    border: 1px solid #d6dce5;
+    border-radius: 12px;
+    background: #ffffff;
+    box-shadow: 0 2px 7px rgba(15, 23, 42, 0.06);
+    transition: box-shadow 0.2s ease, transform 0.2s ease;
+}
+
+.module-item[open] {
+    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.11);
+}
+
+.module-item summary {
+    position: relative;
+    padding: 14px;
+    cursor: pointer;
+    list-style: none;
+}
+
+.module-item summary::-webkit-details-marker {
+    display: none;
+}
+
+.module-item summary::before {
+    content: "▸";
+    position: absolute;
+    top: 20px;
+    left: 14px;
+    color: #344054;
+    font-size: 1rem;
+    transition: transform 0.2s ease;
+}
+
+.module-item[open] summary::before {
+    transform: rotate(90deg);
+}
+
+.module-summary {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+    padding-left: 24px;
+}
+
+.module-box {
+    min-width: 0;
+    min-height: 82px;
+    padding: 12px 14px;
+    border: 1px solid #d9e2ef;
+    border-radius: 10px;
+    overflow-wrap: anywhere;
+}
+
+.module-label {
+    display: block;
+    margin-bottom: 5px;
+    color: #667085;
+    font-size: 0.71rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.module-value {
+    color: #1d2939;
+    font-size: 0.92rem;
+    font-weight: 500;
+    overflow-wrap: anywhere;
+}
+
+.module-value strong {
+    font-weight: 700;
+}
+
+.module-subvalue {
+    margin-top: 4px;
+    color: #667085;
+    font-size: 0.78rem;
+    font-weight: 400;
+}
+
+.module-details {
+    padding: 16px;
+    border-top: 1px solid #e4e7ec;
+    background: #f8fafc;
+}
+
+.module-details-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 14px;
+}
+
+.module-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.module-detail-grid .span-2 {
+    grid-column: span 2;
+}
+
+.module-detail-grid .span-3 {
+    grid-column: span 3;
+}
+
+.module-detail-grid .span-4 {
+    grid-column: 1 / -1;
+}
+
+.module-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 7px;
+    margin-top: 14px;
+}
+
+/* Colores suaves */
+
+.bg-soft-blue {
+    background: #eaf3ff;
+    border-color: #cfe2ff;
+}
+
+.bg-soft-green {
+    background: #eaf8ef;
+    border-color: #cfe9d4;
+}
+
+.bg-soft-yellow {
+    background: #fff8e6;
+    border-color: #f5df9a;
+}
+
+.bg-soft-purple {
+    background: #f2ecff;
+    border-color: #ddd0ff;
+}
+
+.bg-soft-cyan {
+    background: #e9fbff;
+    border-color: #cceff7;
+}
+
+.bg-soft-pink {
+    background: #fff0f4;
+    border-color: #f6d3df;
+}
+
+.bg-soft-gray {
+    background: #f2f4f7;
+    border-color: #d0d5dd;
+}
+
+/* Estados */
+
+.module-status {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 9px;
+    border-radius: 999px;
+    font-size: 0.76rem;
+    font-weight: 700;
+}
+
+.module-status-active {
+    background: #d1fadf;
+    color: #05603a;
+}
+
+.module-status-pending {
+    background: #fef0c7;
+    color: #93370d;
+}
+
+.module-status-closed {
+    background: #fee4e2;
+    color: #b42318;
+}
+
+@media (max-width: 1000px) {
+    .module-summary,
+    .module-detail-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .module-detail-grid .span-3,
+    .module-detail-grid .span-4 {
+        grid-column: 1 / -1;
+    }
+}
+
+@media (max-width: 600px) {
+    .module-summary,
+    .module-detail-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .module-detail-grid .span-2,
+    .module-detail-grid .span-3,
+    .module-detail-grid .span-4 {
+        grid-column: auto;
+    }
+
+    .module-actions {
+        justify-content: stretch;
+    }
+
+    .module-actions .btn,
+    .module-actions form,
+    .module-actions form .btn {
+        width: 100%;
+    }
+}
+
+/* Filtros uniformes de Cuentas, Novedades y Backups */
+.module-filter-card {
+    padding: 16px 18px;
+    border: 1px solid #d0d5dd;
+    border-radius: 10px;
+    background: #ffffff;
+    box-shadow: none;
+}
+
+.module-filter-card .form-label {
+    display: block;
+    min-height: 18px;
+    margin-bottom: 7px;
+    color: #344054;
+    font-size: 0.78rem;
+    font-weight: 500;
+}
+
+.module-filter-control {
+    width: 100%;
+    min-height: 39px;
+    font-size: 0.88rem;
+}
+
+.module-filter-card .row {
+    align-items: end;
+}
+
+@media (max-width: 991px) {
+    .module-filter-card {
+        padding: 14px;
+    }
+}

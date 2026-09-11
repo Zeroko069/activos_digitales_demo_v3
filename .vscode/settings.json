@@ -1,0 +1,4 @@
+{
+    "tokenCount.countingMode": "model",
+    "tokenCount.model": "gpt-4o-mini"
+}

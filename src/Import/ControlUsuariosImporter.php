@@ -1,0 +1,969 @@
+<?php
+declare(strict_types=1);
+
+final class ControlUsuariosImporter
+{
+    private int $importId;
+    private array $stats = [
+        'filas_leidas' => 0,
+        'filas_insertadas' => 0,
+        'filas_actualizadas' => 0,
+        'filas_omitidas' => 0,
+        'errores' => 0,
+        'cuentas' => 0,
+        'personas' => 0,
+        'asignaciones_cuenta' => 0,
+        'asignaciones_licencia' => 0,
+        'respaldos' => 0,
+        'novedades' => 0,
+        'funcionarios' => 0,
+        'reconciliaciones' => 0,
+    ];
+
+    public function __construct(private readonly PDO $pdo)
+    {
+    }
+
+    public function import(string $filePath, bool $force = false): array
+    {
+        $hash = hash_file('sha256', $filePath);
+        if ($hash === false) {
+            throw new RuntimeException('No fue posible calcular el hash del archivo.');
+        }
+        $existing = $this->findExistingImport($hash);
+        if ($existing && !$force) {
+            throw new RuntimeException(
+                'Este archivo ya fue importado. Use --force únicamente si desea reprocesarlo.'
+            );
+        }
+
+        $this->importId = $this->startImport($filePath, $hash, $existing ? (int)$existing['id'] : null);
+        $reader = new SimpleXlsxReader($filePath);
+
+        try {
+            $this->pdo->beginTransaction();
+            foreach ([
+                ['sheet' => 'BASE_PPAL', 'country' => 'CO'],
+                ['sheet' => 'CORREOS-PERÚ', 'country' => 'PE'],
+            ] as $source) {
+                if (in_array($source['sheet'], $reader->sheetNames(), true)) {
+                    $this->importAccounts($reader, $source['sheet'], $source['country']);
+                }
+            }
+            if(in_array('MatrizHDUniclass', $reader->sheetNames(), true)) {
+                $this->importPeopleColombia($reader);
+                $this->reconcilePendingAssignments('CO');
+            }
+            if(in_array('PLANTA PERU', $reader->sheetNames(), true)) {
+                $this->importPeoplePeru($reader);
+                $this->reconcilePendingAssignments('PE');
+            }
+            if (in_array('Backup-Correos', $reader->sheetNames(), true)) {
+                $this->importBackups($reader);
+            }
+            if (in_array('NOVEDADES', $reader->sheetNames(), true)) {
+                $this->importNews($reader);
+            }
+            $this->pdo->commit();
+            $this->finishImport($this->stats['errores'] > 0 ? 'COMPLETADA_CON_ERRORES' : 'COMPLETADA');
+            return $this->stats + ['importacion_id' => $this->importId];
+        } catch (Throwable $e) {
+            if ($this->pdo->inTransaction()) {
+                $this->pdo->rollBack();
+            }
+            $this->finishImport('FALLIDA', $e->getMessage());
+            throw $e;
+        }
+    }
+
+    private function normalizeDocument(
+    mixed $value
+): ?string {
+    if ($value === null) {
+        return null;
+    }
+
+    $value = trim((string)$value);
+
+    if ($value === '') {
+        return null;
+    }
+
+    /*
+     * Quitar sufijos decimales del Excel:
+     * 1000862587.0 -> 1000862587
+     */
+    $value = preg_replace('/\.0+$/', '', $value) ?? $value;
+
+    /*
+     * Conservar solo dígitos.
+     */
+    $value = preg_replace('/\D+/', '', $value) ?? '';
+
+    return $value !== '' ? $value : null;
+}
+
+    private function importAccounts(SimpleXlsxReader $reader, string $sheet, string $country): void
+    {
+        foreach ($reader->rows($sheet) as $row) {
+            $this->stats['filas_leidas']++;
+            try {
+                $email = ad_email_normalize((string)($row['NOMBRE_USUARIO'] ?? ''));
+                if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                    $this->skipOrError($sheet, $row, 'NOMBRE_USUARIO', 'Correo vacío o inválido.', true);
+                    continue;
+                }
+
+                $reasonRaw = trim((string)($row['RAZON_SOCIAL'] ?? $row['EMPRESA'] ?? ''));
+                $reasonId = $reasonRaw !== '' && !$this->isNullToken($reasonRaw)
+                    ? $this->upsertReason($reasonRaw, $country)
+                    : null;
+
+                $document = $this->cleanNullable($row['NUM_DOCUMENTO'] ?? null);
+                $personId = null;
+                if ($document !== null) {
+                    $personId = $this->upsertPerson([
+                        'pais' => $country,
+                        'documento' => $document,
+                        'nombre' => $this->cleanNullable($row['APELLIDO NOMBRE'] ?? null),
+                        'cargo' => $this->cleanNullable($row['CARGO'] ?? null),
+                        'ciudad' => $this->cleanNullable($row['CIUDAD LABOR'] ?? null),
+                        'proceso' => $this->cleanNullable($row['CU1-PROCESO'] ?? null),
+                        'cliente' => $this->cleanNullable($row['CU3-CLIENTE'] ?? null),
+                        'proyecto' => $this->cleanNullable($row['CU3-PROYECTO'] ?? null),
+                        'razon_social_id' => $reasonId,
+                        'fuente' => $sheet,
+                        'fuente_id' => (string)($row['_row'] ?? ''),
+                    ]);
+                }
+
+                $domainName = substr(strrchr($email, '@') ?: '', 1);
+                $domainId = $domainName !== '' ? $this->upsertDomain($domainName, $reasonId) : null;
+                $accountId = $this->upsertAccount([
+                    'correo' => $email,
+                    'dominio_id' => $domainId,
+                    'tipo' => $personId ? 'PERSONAL' : 'GENERICA',
+                    'razon_social_id' => $reasonId,
+                    'pais' => $country,
+                    'ciudad' => $this->cleanNullable($row['CIUDAD LABOR'] ?? null),
+                    'observaciones' => $this->cleanNullable($row['OBSERVACIÓN (Solicitante)'] ?? null),
+                    'fecha_creacion' => ad_excel_serial_to_date($row['FECHA_CREACION'] ?? null),
+                    'legacy_sheet' => $sheet,
+                    'legacy_row' => (int)($row['_row'] ?? 0),
+                ]);
+
+                if ($personId !== null) {
+                    if ($this->ensureAccountAssignment($accountId, $personId, ad_excel_serial_to_date($row['FECHA_CREACION'] ?? null))) {
+                        $this->stats['asignaciones_cuenta']++;
+                    }
+                }
+
+                $planRaw = $this->cleanNullable($row['PLAN'] ?? null);
+                if ($planRaw !== null) {
+                    $planId = $this->resolvePlan($planRaw);
+                    $price = is_numeric($row['PRECIO USD'] ?? null) ? (float)$row['PRECIO USD'] : 0.0;
+                    $subscriptionId = $this->resolveImportedSubscription(
+                        $planId,
+                        $price,
+                        $country,
+                        $reasonId,
+                        (string)($row['DOMINIO'] ?? '')
+                    );
+                    if ($this->ensureLicenseAssignment(
+                        $accountId,
+                        $subscriptionId,
+                        ad_excel_serial_to_date($row['FECHA_CREACION'] ?? null),
+                        $price
+                    )) {
+                        $this->stats['asignaciones_licencia']++;
+                    }
+                }
+                $this->stats['filas_insertadas']++;
+            } catch (Throwable $e) {
+                $this->recordError($sheet, (int)($row['_row'] ?? 0), null, $e->getMessage(), $row);
+            }
+        }
+    }
+
+    private function importPeopleColombia(
+        SimpleXlsxReader $reader
+    ): void {
+        foreach ($reader->rows('MatrizHDUniclass') as $row) {
+            $this->stats['filas_leidas']++;
+
+            try {
+                $documento = $this->normalizeDocument(
+                    $row['IDENTIFICACION'] ?? null
+                );
+
+                if ($documento === null) {
+                    $this->stats['filas_omitidas']++;
+                    continue;
+                }
+
+                $empresa = $this->cleanNullable(
+                    $row['EMPRESA'] ?? null
+                );
+
+                $razonSocialId = $empresa !== null
+                    ? $this->upsertReason($empresa, 'CO')
+                    : null;
+
+                $this->upsertPerson([
+                    'pais' => 'CO',
+
+                    'documento' => $documento,
+
+                    'nombre' => $this->cleanNullable(
+                        $row['APELLIDOS_Y_NOMBRES']
+                            ?? $row['APELLIDOS Y NOMBRES']
+                            ?? null
+                    ),
+
+                    'cargo' => $this->cleanNullable(
+                        $row['NOMBRE_PUESTO']
+                            ?? $row['CARGO']
+                            ?? null
+                    ),
+
+                    'ciudad' => $this->cleanNullable(
+                        $row['CU1_CIUDAD']
+                            ?? $row['CIUDAD']
+                            ?? null
+                    ),
+
+                    'proceso' => $this->cleanNullable(
+                        $row['CU1_PROCESO']
+                            ?? $row['PROCESO GEN']
+                            ?? null
+                    ),
+
+                    'cliente' => $this->cleanNullable(
+                        $row['CU3_CLIENTE'] ?? null
+                    ),
+
+                    'proyecto' => $this->cleanNullable(
+                        $row['CU3_PROYECTO'] ?? null
+                    ),
+
+                    'razon_social_id' => $razonSocialId,
+
+                    'estado_laboral' => 'SIN_VALIDAR',
+
+                    'fuente' => 'MatrizHDUniclass',
+
+                    'fuente_id' => $this->cleanNullable(
+                        $row['ID_EMP'] ?? null
+                    ) ?? (string)($row['_row'] ?? ''),
+                ]);
+
+                $this->stats['filas_insertadas']++;
+            } catch (Throwable $e) {
+                $this->recordError(
+                    'MatrizHDUniclass',
+                    (int)($row['_row'] ?? 0),
+                    null,
+                    $e->getMessage(),
+                    $row
+                );
+            }
+        }
+    }
+
+    private function importPeoplePeru(
+        SimpleXlsxReader $reader
+    ): void {
+        foreach ($reader->rows('PLANTA PERU') as $row) {
+            $this->stats['filas_leidas']++;
+
+            try {
+                $documento = $this->normalizeDocument(
+                    $row['CEDULA']
+                        ?? $row['DOCUMENTO']
+                        ?? $row['NUM_DOCUMENTO']
+                        ?? null
+                );
+
+                if ($documento === null) {
+                    $this->stats['filas_omitidas']++;
+                    continue;
+                }
+
+                $empresa = $this->cleanNullable(
+                    $row['EMPRESA'] ?? null
+                ) ?? 'CONECTAR TELECOMUNICACIONES SAC';
+
+                $razonSocialId = $this->upsertReason(
+                    $empresa,
+                    'PE'
+                );
+
+                $this->upsertPerson([
+                    'pais' => 'PE',
+
+                    'documento' => $documento,
+
+                    'nombre' => $this->cleanNullable(
+                        $row['APELLIDOS Y NOMBRES']
+                            ?? $row['APELLIDOS_Y_NOMBRES']
+                            ?? $row['NOMBRE']
+                            ?? null
+                    ),
+
+                    'cargo' => $this->cleanNullable(
+                        $row['CARGO']
+                            ?? $row['NOMBRE_PUESTO']
+                            ?? null
+                    ),
+
+                    'ciudad' => $this->cleanNullable(
+                        $row['CIUDAD OPE']
+                            ?? $row['CIUDAD']
+                            ?? $row['CIUDAD LABOR']
+                            ?? null
+                    ),
+
+                    'proceso' => $this->cleanNullable(
+                        $row['PROCESO']
+                            ?? $row['CU1_PROCESO']
+                            ?? null
+                    ),
+
+                    'cliente' => $this->cleanNullable(
+                        $row['CLIENTE']
+                            ?? $row['CU3_CLIENTE']
+                            ?? null
+                    ),
+
+                    'proyecto' => $this->cleanNullable(
+                        $row['PROYECTO']
+                            ?? $row['CU3_PROYECTO']
+                            ?? null
+                    ),
+
+                    'razon_social_id' => $razonSocialId,
+
+                    'estado_laboral' => 'SIN_VALIDAR',
+
+                    'fuente' => 'PLANTA PERU',
+
+                    'fuente_id' => (string)(
+                        $row['_row'] ?? ''
+                    ),
+                ]);
+
+                $this->stats['filas_insertadas']++;
+            } catch (Throwable $e) {
+                $this->recordError(
+                    'PLANTA PERU',
+                    (int)($row['_row'] ?? 0),
+                    null,
+                    $e->getMessage(),
+                    $row
+                );
+            }
+        }
+    }
+
+
+
+    private function importBackups(SimpleXlsxReader $reader): void
+    {
+        foreach ($reader->rows('Backup-Correos') as $row) {
+            $this->stats['filas_leidas']++;
+            try {
+                $stmt = $this->pdo->prepare(
+                    'INSERT INTO ad_respaldos
+                     (servidor, carpeta, subcarpeta_1, subcarpeta_2, subcarpeta_3, archivo,
+                      repositorio_cloud, fecha_carga, tamano_pst, tamano_onedrive, legacy_row)
+                     VALUES
+                     (:servidor, :carpeta, :sub1, :sub2, :sub3, :archivo,
+                      :cloud, :fecha, :pst, :onedrive, :legacy_row)
+                     ON DUPLICATE KEY UPDATE
+                      servidor=VALUES(servidor), carpeta=VALUES(carpeta), subcarpeta_1=VALUES(subcarpeta_1),
+                      subcarpeta_2=VALUES(subcarpeta_2), subcarpeta_3=VALUES(subcarpeta_3),
+                      archivo=VALUES(archivo), repositorio_cloud=VALUES(repositorio_cloud),
+                      fecha_carga=VALUES(fecha_carga), tamano_pst=VALUES(tamano_pst),
+                      tamano_onedrive=VALUES(tamano_onedrive)'
+                );
+                $stmt->execute([
+                    ':servidor' => $this->cleanNullable($row['Servidor'] ?? null),
+                    ':carpeta' => $this->cleanNullable($row['Carpeta'] ?? null),
+                    ':sub1' => $this->cleanNullable($row['Carpeta 1'] ?? null),
+                    ':sub2' => $this->cleanNullable($row['Carpeta 2'] ?? null),
+                    ':sub3' => $this->cleanNullable($row['Carpeta 3'] ?? null),
+                    ':archivo' => $this->cleanNullable($row['Archivo'] ?? null),
+                    ':cloud' => $this->cleanNullable($row['CLOUD'] ?? null),
+                    ':fecha' => ad_excel_serial_to_date($row['FECHA CARGA'] ?? null),
+                    ':pst' => $this->cleanNullable($row['TamPST '] ?? $row['Tam PST'] ?? null),
+                    ':onedrive' => $this->cleanNullable($row['Tam  OneDrive'] ?? null),
+                    ':legacy_row' => (int)($row['_row'] ?? 0),
+                ]);
+                $this->stats['respaldos']++;
+                $this->stats['filas_insertadas']++;
+            } catch (Throwable $e) {
+                $this->recordError('Backup-Correos', (int)($row['_row'] ?? 0), null, $e->getMessage(), $row);
+            }
+        }
+    }
+
+    private function importNews(SimpleXlsxReader $reader): void
+{
+    foreach ($reader->rows('NOVEDADES') as $row) {
+        $this->stats['filas_leidas']++;
+
+        try {
+            $email = ad_email_normalize(
+                (string)($row['NOMBRE_USUARIO'] ?? '')
+            );
+
+            $accountId = null;
+
+            if (
+                $email !== ''
+                && filter_var($email, FILTER_VALIDATE_EMAIL)
+            ) {
+                $stmt = $this->pdo->prepare(
+                    'SELECT id
+                     FROM ad_cuentas
+                     WHERE correo_normalizado=:correo
+                     LIMIT 1'
+                );
+
+                $stmt->execute([
+                    ':correo' => $email
+                ]);
+
+                $accountId = $stmt->fetchColumn() ?: null;
+            }
+
+            $mainObservation = $this->cleanNullable(
+                $row['OBSERVACION'] ?? null
+            );
+
+            $requestObservation = $this->cleanNullable(
+                $row['OBSERVACIÓN (Solicitante)'] ?? null
+            );
+
+            $descriptionParts = array_values(array_filter([
+                $mainObservation,
+                $requestObservation !== null
+                    ? 'Solicitante: ' . $requestObservation
+                    : null,
+            ]));
+
+            $description = $descriptionParts !== []
+                ? implode(' | ', $descriptionParts)
+                : 'Novedad migrada desde Excel';
+
+            $normalizedObservation = ad_normalize_text(
+                $mainObservation ?? ''
+            );
+
+            $type = str_contains(
+                $normalizedObservation,
+                'CAMBIO DE ASIGNACION'
+            )
+                ? 'CAMBIO_ASIGNACION'
+                : (
+                    str_contains(
+                        $normalizedObservation,
+                        'ELIMIN'
+                    )
+                        ? 'ELIMINACION'
+                        : (
+                            str_contains(
+                                $normalizedObservation,
+                                'BAJA'
+                            )
+                                ? 'BAJA_CORREO'
+                                : 'MIGRACION_EXCEL'
+                        )
+                );
+
+            $noveltyDate = ad_excel_serial_to_date(
+                $row['Fecha Modificación'] ?? null
+            ) ?? ad_excel_serial_to_date(
+                $row['FECHA_CREACION'] ?? null
+            );
+
+            $stmt = $this->pdo->prepare(
+                'INSERT INTO ad_novedades
+                 (
+                    cuenta_id,
+                    tipo,
+                    estado,
+                    fecha_novedad,
+                    descripcion,
+                    datos_origen,
+                    legacy_sheet,
+                    legacy_row
+                 )
+                 VALUES
+                 (
+                    :cuenta,
+                    :tipo,
+                    "ABIERTA",
+                    :fecha,
+                    :descripcion,
+                    :datos,
+                    "NOVEDADES",
+                    :fila
+                 )
+                 ON DUPLICATE KEY UPDATE
+                    cuenta_id=VALUES(cuenta_id),
+                    tipo=VALUES(tipo),
+                    fecha_novedad=VALUES(fecha_novedad),
+                    descripcion=VALUES(descripcion),
+                    datos_origen=VALUES(datos_origen)'
+            );
+
+            $stmt->execute([
+                ':cuenta' => $accountId,
+                ':tipo' => $type,
+                ':fecha' => $noveltyDate,
+                ':descripcion' => $description,
+                ':datos' => json_encode(
+                    $row,
+                    JSON_UNESCAPED_UNICODE
+                ),
+                ':fila' => (int)($row['_row'] ?? 0),
+            ]);
+
+            $this->stats['novedades']++;
+            $this->stats['filas_insertadas']++;
+        } catch (Throwable $e) {
+            $this->recordError(
+                'NOVEDADES',
+                (int)($row['_row'] ?? 0),
+                null,
+                $e->getMessage(),
+                $row
+            );
+        }
+    }
+}
+
+    private function upsertReason(string $rawName, string $country): int
+    {
+        $name = trim($rawName);
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO ad_razones_sociales (codigo, nombre, pais)
+             VALUES (:codigo, :nombre, :pais)
+             ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id), codigo=COALESCE(codigo, VALUES(codigo))'
+        );
+        $code = mb_strlen($name) <= 30 ? mb_strtoupper($name, 'UTF-8') : null;
+        $stmt->execute([':codigo' => $code, ':nombre' => $name, ':pais' => $country]);
+        return (int)$this->pdo->lastInsertId();
+    }
+
+    private function upsertPerson(array $data): int
+{
+    $stmt = $this->pdo->prepare(
+        'INSERT INTO ad_personas
+         (
+            pais,
+            numero_documento,
+            nombre_completo,
+            cargo,
+            ciudad,
+            proceso,
+            cliente,
+            proyecto,
+            razon_social_id,
+            estado_laboral,
+            fuente,
+            fuente_id
+         )
+         VALUES
+         (
+            :pais,
+            :documento,
+            :nombre,
+            :cargo,
+            :ciudad,
+            :proceso,
+            :cliente,
+            :proyecto,
+            :razon,
+            :estado_laboral,
+            :fuente,
+            :fuente_id
+         )
+         ON DUPLICATE KEY UPDATE
+            id=LAST_INSERT_ID(id),
+            nombre_completo=CASE
+    WHEN VALUES(fuente) IN (
+        "MatrizHDUniclass",
+        "PLANTA PERU"
+    )
+    AND NULLIF(
+        TRIM(VALUES(nombre_completo)),
+        ""
+    ) IS NOT NULL
+    THEN TRIM(VALUES(nombre_completo))
+
+    ELSE COALESCE(
+        NULLIF(
+            TRIM(VALUES(nombre_completo)),
+            ""
+        ),
+        nombre_completo
+    )
+END,
+            cargo=COALESCE(VALUES(cargo), cargo),
+            ciudad=COALESCE(VALUES(ciudad), ciudad),
+            proceso=COALESCE(VALUES(proceso), proceso),
+            cliente=COALESCE(VALUES(cliente), cliente),
+            proyecto=COALESCE(VALUES(proyecto), proyecto),
+            razon_social_id=COALESCE(
+                VALUES(razon_social_id),
+                razon_social_id
+            ),
+            estado_laboral=CASE
+                WHEN VALUES(fuente) IN (
+                    "MatrizHDUniclass",
+                    "PLANTA PERU"
+                )
+                THEN VALUES(estado_laboral)
+                ELSE estado_laboral
+            END,
+            fuente=VALUES(fuente),
+            fuente_id=VALUES(fuente_id)'
+    );
+
+    $stmt->execute([
+        ':pais' => $data['pais'],
+        ':documento' => $data['documento'],
+        ':nombre' => $data['nombre'],
+        ':cargo' => $data['cargo'],
+        ':ciudad' => $data['ciudad'],
+        ':proceso' => $data['proceso'],
+        ':cliente' => $data['cliente'],
+        ':proyecto' => $data['proyecto'],
+        ':razon' => $data['razon_social_id'],
+        ':estado_laboral' =>
+            $data['estado_laboral'] ?? 'SIN_VALIDAR',
+        ':fuente' => $data['fuente'],
+        ':fuente_id' => $data['fuente_id'],
+    ]);
+
+    $this->stats['personas']++;
+
+    return (int)$this->pdo->lastInsertId();
+}
+
+    private function upsertDomain(string $domain, ?int $reasonId): int
+    {
+        $domain = mb_strtolower(trim($domain), 'UTF-8');
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO ad_dominios (dominio, razon_social_id)
+             VALUES (:dominio, :razon)
+             ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id), razon_social_id=COALESCE(razon_social_id, VALUES(razon_social_id))'
+        );
+        $stmt->execute([':dominio' => $domain, ':razon' => $reasonId]);
+        return (int)$this->pdo->lastInsertId();
+    }
+
+    private function upsertAccount(array $data): int
+    {
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO ad_cuentas
+             (correo, correo_normalizado, dominio_id, tipo, estado, razon_social_id, pais, ciudad,
+              observaciones, fecha_creacion, legacy_sheet, legacy_row)
+             VALUES
+             (:correo, :correo_normalizado, :dominio, :tipo, "ACTIVA", :razon, :pais, :ciudad,
+              :observaciones, :fecha, :hoja, :fila)
+             ON DUPLICATE KEY UPDATE
+              id=LAST_INSERT_ID(id), dominio_id=COALESCE(VALUES(dominio_id), dominio_id),
+              razon_social_id=COALESCE(VALUES(razon_social_id), razon_social_id),
+              ciudad=COALESCE(VALUES(ciudad), ciudad), observaciones=COALESCE(VALUES(observaciones), observaciones),
+              legacy_sheet=VALUES(legacy_sheet), legacy_row=VALUES(legacy_row)'
+        );
+        $stmt->execute([
+            ':correo' => $data['correo'], ':correo_normalizado' => ad_email_normalize($data['correo']),
+            ':dominio' => $data['dominio_id'], ':tipo' => $data['tipo'], ':razon' => $data['razon_social_id'],
+            ':pais' => $data['pais'], ':ciudad' => $data['ciudad'], ':observaciones' => $data['observaciones'],
+            ':fecha' => $data['fecha_creacion'], ':hoja' => $data['legacy_sheet'], ':fila' => $data['legacy_row'],
+        ]);
+        $this->stats['cuentas']++;
+        return (int)$this->pdo->lastInsertId();
+    }
+
+    private function ensureAccountAssignment(int $accountId, int $personId, ?string $startDate): bool
+    {
+        $stmt = $this->pdo->prepare(
+            'SELECT id FROM ad_asignaciones_cuenta
+             WHERE cuenta_id=:cuenta AND persona_id=:persona AND estado="ACTIVA" LIMIT 1'
+        );
+        $stmt->execute([':cuenta' => $accountId, ':persona' => $personId]);
+        if ($stmt->fetchColumn()) {
+            return false;
+        }
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO ad_asignaciones_cuenta
+             (cuenta_id, persona_id, fecha_inicio, estado, motivo)
+             VALUES (:cuenta, :persona, :fecha, "ACTIVA", "MIGRACION_EXCEL")'
+        );
+        $stmt->execute([
+            ':cuenta' => $accountId,
+            ':persona' => $personId,
+            ':fecha' => $startDate ?: date('Y-m-d'),
+        ]);
+        return true;
+    }
+
+    private function reconcilePendingAssignments(string $country): void
+    {
+        $stmt = $this->pdo->prepare(
+            'SELECT id, persona_id, cuenta_id, observaciones
+             FROM ad_asignaciones_cuenta
+             WHERE estado = "PENDIENTE"
+               AND motivo = "CAMBIO_ASIGNACION_PENDIENTE"
+               AND persona_id IS NULL'
+        );
+        $stmt->execute();
+
+        $assignments = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        if (!$assignments) {
+            return;
+        }
+
+        $documentToAssignments = [];
+        foreach ($assignments as $assignment) {
+            $observation = (string)($assignment['observaciones'] ?? '');
+            if ($observation === '') {
+                continue;
+            }
+
+            if (!preg_match('/documento:\s*([0-9]+).*pais:\s*([A-Z]{2})/i', $observation, $matches)) {
+                continue;
+            }
+
+            $document = $this->normalizeDocument($matches[1]);
+            $assignmentCountry = strtoupper(trim($matches[2]));
+            if ($document === null || $assignmentCountry !== strtoupper($country)) {
+                continue;
+            }
+
+            $documentToAssignments[$document][] = (int)$assignment['id'];
+        }
+
+        if ($documentToAssignments === []) {
+            return;
+        }
+
+        $placeholders = implode(',', array_fill(0, count($documentToAssignments), '?'));
+        $query = 'SELECT id, numero_documento FROM ad_personas
+                  WHERE pais = ?
+                    AND numero_documento IN (' . $placeholders . ')';
+        $stmt = $this->pdo->prepare($query);
+        $params = array_merge([$country], array_keys($documentToAssignments));
+        $stmt->execute($params);
+
+        $persons = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($persons as $person) {
+            $document = $this->normalizeDocument($person['numero_documento']);
+            if ($document === null || !isset($documentToAssignments[$document])) {
+                continue;
+            }
+
+            foreach ($documentToAssignments[$document] as $assignmentId) {
+                $this->pdo->prepare(
+                    'UPDATE ad_asignaciones_cuenta
+                     SET persona_id = :persona,
+                         estado = "ACTIVA",
+                         motivo = "CAMBIO_ASIGNACION"
+                     WHERE id = :id'
+                )->execute([
+                    ':persona' => $person['id'],
+                    ':id' => $assignmentId,
+                ]);
+
+                $this->stats['reconciliaciones']++;
+            }
+        }
+    }
+
+    private function resolvePlan(string $rawName): int
+    {
+        $normalized = ad_normalize_text($rawName);
+        $stmt = $this->pdo->prepare(
+            'SELECT plan_id FROM ad_plan_aliases WHERE alias_normalizado=:alias LIMIT 1'
+        );
+        $stmt->execute([':alias' => $normalized]);
+        $planId = $stmt->fetchColumn();
+        if ($planId) {
+            return (int)$planId;
+        }
+        $stmt = $this->pdo->prepare('SELECT id FROM ad_planes WHERE nombre=:nombre LIMIT 1');
+        $stmt->execute([':nombre' => $normalized]);
+        $planId = $stmt->fetchColumn();
+        if ($planId) {
+            return (int)$planId;
+        }
+        $code = 'MIG_' . strtoupper(substr(hash('sha256', $normalized), 0, 12));
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO ad_planes (codigo, nombre, categoria) VALUES (:codigo, :nombre, "OTRO")'
+        );
+        $stmt->execute([':codigo' => $code, ':nombre' => $normalized]);
+        $planId = (int)$this->pdo->lastInsertId();
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO ad_plan_aliases (plan_id, alias, alias_normalizado) VALUES (:plan, :alias, :normalizado)'
+        );
+        $stmt->execute([':plan' => $planId, ':alias' => $rawName, ':normalizado' => $normalized]);
+        return $planId;
+    }
+
+    private function resolveImportedSubscription(
+        int $planId,
+        float $price,
+        string $country,
+        ?int $reasonId,
+        string $domainCategory
+    ): int {
+        $hash = hash('sha256', implode('|', [
+            'MIGRACION_EXCEL', $planId, number_format($price, 4, '.', ''), $country,
+            $reasonId ?? 'NULL', ad_normalize_text($domainCategory),
+        ]));
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO ad_suscripciones
+             (plan_id, razon_social_id, referencia_contrato, pais, valor_unitario, moneda,
+              periodicidad, estado, origen, hash_importacion)
+             VALUES
+             (:plan, :razon, :referencia, :pais, :valor, "USD", "MENSUAL", "VIGENTE", "MIGRACION_EXCEL", :hash)
+             ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id), valor_unitario=VALUES(valor_unitario)'
+        );
+        $stmt->execute([
+            ':plan' => $planId,
+            ':razon' => $reasonId,
+            ':referencia' => 'MIG-' . $country . '-' . substr($hash, 0, 10),
+            ':pais' => $country,
+            ':valor' => $price,
+            ':hash' => $hash,
+        ]);
+        return (int)$this->pdo->lastInsertId();
+    }
+
+    private function ensureLicenseAssignment(
+        int $accountId,
+        int $subscriptionId,
+        ?string $startDate,
+        float $price
+    ): bool {
+        $stmt = $this->pdo->prepare(
+            'SELECT id FROM ad_asignaciones_licencia
+             WHERE cuenta_id=:cuenta AND suscripcion_id=:suscripcion AND estado="ACTIVA" LIMIT 1'
+        );
+        $stmt->execute([':cuenta' => $accountId, ':suscripcion' => $subscriptionId]);
+        if ($stmt->fetchColumn()) {
+            return false;
+        }
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO ad_asignaciones_licencia
+             (cuenta_id, suscripcion_id, fecha_inicio, valor_unitario_asignado, moneda, estado, motivo)
+             VALUES (:cuenta, :suscripcion, :fecha, :valor, "USD", "ACTIVA", "MIGRACION_EXCEL")'
+        );
+        $stmt->execute([
+            ':cuenta' => $accountId,
+            ':suscripcion' => $subscriptionId,
+            ':fecha' => $startDate ?: date('Y-m-d'),
+            ':valor' => $price,
+        ]);
+        return true;
+    }
+
+    private function findExistingImport(string $hash): ?array
+    {
+        $stmt = $this->pdo->prepare(
+            'SELECT * FROM ad_importaciones WHERE hash_archivo=:hash AND tipo="CONTROL_USUARIOS" LIMIT 1'
+        );
+        $stmt->execute([':hash' => $hash]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return $row ?: null;
+    }
+
+    private function startImport(string $filePath, string $hash, ?int $existingId): int
+    {
+        if ($existingId !== null) {
+            $stmt = $this->pdo->prepare(
+                'UPDATE ad_importaciones SET estado="INICIADA", started_at=NOW(), finished_at=NULL,
+                 filas_leidas=0, filas_insertadas=0, filas_actualizadas=0, filas_omitidas=0,
+                 errores=0, resumen=NULL WHERE id=:id'
+            );
+            $stmt->execute([':id' => $existingId]);
+            $clear = $this->pdo->prepare('DELETE FROM ad_importacion_errores WHERE importacion_id=:id');
+            $clear->execute([':id' => $existingId]);
+            return $existingId;
+        }
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO ad_importaciones (archivo, hash_archivo, tipo, ejecutado_por)
+             VALUES (:archivo, :hash, "CONTROL_USUARIOS", :usuario)'
+        );
+        $stmt->execute([
+            ':archivo' => basename($filePath), ':hash' => $hash, ':usuario' => ad_current_user_id(),
+        ]);
+        return (int)$this->pdo->lastInsertId();
+    }
+
+    private function finishImport(string $status, ?string $fatalMessage = null): void
+    {
+        $summary = $this->stats;
+        if ($fatalMessage !== null) {
+            $summary['error_fatal'] = $fatalMessage;
+        }
+        $stmt = $this->pdo->prepare(
+            'UPDATE ad_importaciones SET estado=:estado, filas_leidas=:leidas,
+             filas_insertadas=:insertadas, filas_actualizadas=:actualizadas,
+             filas_omitidas=:omitidas, errores=:errores, resumen=:resumen, finished_at=NOW()
+             WHERE id=:id'
+        );
+        $stmt->execute([
+            ':estado' => $status,
+            ':leidas' => $this->stats['filas_leidas'],
+            ':insertadas' => $this->stats['filas_insertadas'],
+            ':actualizadas' => $this->stats['filas_actualizadas'],
+            ':omitidas' => $this->stats['filas_omitidas'],
+            ':errores' => $this->stats['errores'],
+            ':resumen' => json_encode($summary, JSON_UNESCAPED_UNICODE),
+            ':id' => $this->importId,
+        ]);
+    }
+
+    private function skipOrError(string $sheet, array $row, ?string $field, string $message, bool $skip): void
+    {
+        if ($skip) {
+            $this->stats['filas_omitidas']++;
+        }
+        $this->recordError($sheet, (int)($row['_row'] ?? 0), $field, $message, $row);
+    }
+
+    private function recordError(string $sheet, int $row, ?string $field, string $message, array $data): void
+    {
+        $this->stats['errores']++;
+        $stmt = $this->pdo->prepare(
+            'INSERT INTO ad_importacion_errores
+             (importacion_id, hoja, fila, campo, mensaje, datos)
+             VALUES (:importacion, :hoja, :fila, :campo, :mensaje, :datos)'
+        );
+        $stmt->execute([
+            ':importacion' => $this->importId,
+            ':hoja' => $sheet,
+            ':fila' => $row,
+            ':campo' => $field,
+            ':mensaje' => mb_substr($message, 0, 500),
+            ':datos' => json_encode($data, JSON_UNESCAPED_UNICODE),
+        ]);
+    }
+
+    private function cleanNullable(mixed $value): ?string
+    {
+        $value = trim((string)$value);
+        return $value === '' || $this->isNullToken($value) ? null : $value;
+    }
+
+    private function isNullToken(string $value): bool
+    {
+        return in_array(ad_normalize_text($value), ['NA', 'N/A', '#N/A', 'NULL', '0'], true);
+    }
+}

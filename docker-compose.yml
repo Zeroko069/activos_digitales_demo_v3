@@ -1,0 +1,87 @@
+name: activos-digitales-prueba
+
+services:
+  database:
+    image: mariadb:11.4
+    restart: unless-stopped
+
+    environment:
+      MARIADB_DATABASE: activos_digitales_test
+      MARIADB_USER: activos_test
+      MARIADB_PASSWORD: Prueba2026
+      MARIADB_ROOT_PASSWORD: RootTest2026!
+      TZ: America/Bogota
+
+    volumes:
+      - activos_db_data:/var/lib/mysql
+      - ./database/init:/docker-entrypoint-initdb.d:ro
+
+    healthcheck:
+      test:
+        - CMD
+        - healthcheck.sh
+        - --connect
+        - --innodb_initialized
+      start_period: 30s
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    restart: unless-stopped
+
+    depends_on:
+      database:
+        condition: service_healthy
+        restart: true 
+
+    environment:
+      APP_ENV: testing
+      APP_NAME: Activos Digitales - Base de Prueba
+      APP_BASE_URL: ""
+      APP_TIMEZONE: America/Bogota
+      APP_STORAGE_PATH: /var/www/html/storage
+
+      DB_HOST: database
+      DB_PORT: 3306
+      DB_DATABASE: activos_digitales_test
+      DB_USERNAME: activos_test
+      DB_PASSWORD: Prueba2026
+
+      AUTO_IMPORT_SAMPLE: "0"
+
+    ports:
+      - "8085:80"
+
+    volumes:
+      - activos_storage:/var/www/html/storage
+      # Permite importar nuevos archivos ubicados en sample_data sin reconstruir la imagen.
+      - ./sample_data:/var/www/html/sample_data:ro
+
+  phpmyadmin:
+    image: phpmyadmin:5.2-apache
+    restart: unless-stopped
+
+    depends_on:
+      database:
+        condition: service_healthy
+        restart: true 
+
+    environment:
+      PMA_HOST: database
+      PMA_PORT: 3306
+      PMA_USER: activos_test
+      PMA_PASSWORD: Prueba2026
+      PMA_ARBITRARY: "0"
+      UPLOAD_LIMIT: 32M
+
+    ports:
+      - "8086:80"
+
+volumes:
+  activos_db_data:
+  activos_storage:

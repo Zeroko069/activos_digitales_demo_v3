@@ -1,0 +1,4 @@
+/storage/facturas/*
+!/storage/facturas/.gitkeep
+*.log
+.env

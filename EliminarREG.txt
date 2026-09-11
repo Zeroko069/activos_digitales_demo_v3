@@ -1,0 +1,85 @@
+ELIMINAR CUENTAS DE NOVEDADES Y BACKUPS (CAMBIAR EL ID)
+
+SET @cuenta_id = 8316;
+
+START TRANSACTION;
+
+DELETE FROM ad_novedades
+WHERE cuenta_id = @cuenta_id;
+
+DELETE FROM ad_respaldos
+WHERE cuenta_id = @cuenta_id;
+
+COMMIT;
+
+--------------------------------------------------------------------
+VERIFICAR USUARIO DESPUES DE ELIMINAR 
+
+SELECT COUNT(*) AS novedades_restantes
+FROM ad_novedades
+WHERE cuenta_id = 8320;
+
+SELECT COUNT(*) AS backups_restantes
+FROM ad_respaldos
+WHERE cuenta_id = 8320;
+
+--------------------------------------------------------------------
+VER CUENTAS CON CORREO EXISTENTE 
+
+SELECT
+    id,
+    correo,
+    estado,
+    fecha_creacion,
+    fecha_eliminacion
+FROM ad_cuentas
+WHERE LOWER(TRIM(correo)) =
+      LOWER(TRIM('prueba@grupoconectar.co'))
+ORDER BY id DESC;
+
+------------------------------------------------------------------
+IDENTIFICAR ID DE NOVEDADES
+
+SELECT
+    n.id AS novedad_id,
+    c.correo,
+    n.tipo,
+    n.fecha_novedad,
+    n.descripcion
+FROM ad_novedades n
+LEFT JOIN ad_cuentas c
+    ON c.id = n.cuenta_id
+ORDER BY n.id DESC;
+
+-----------------------------------------------------------
+IDENTIFICAR ID DE BACKUP
+
+SELECT
+    r.id AS backup_id,
+    c.correo,
+    r.servidor,
+    r.carpeta,
+    r.archivo,
+    r.fecha_carga,
+    r.tamano_pst,
+    r.tamano_onedrive
+FROM ad_respaldos r
+LEFT JOIN ad_cuentas c
+    ON c.id = r.cuenta_id
+ORDER BY r.id DESC;
+
+-------------------------------------------------------
+ELIMINAR NOVEDAD Y BACKUP ESPECIFICO AL TIEMPO (CAMBIAR ID)
+
+SET @novedad_id = 2512;
+SET @backup_id = 2875;
+
+START TRANSACTION;
+
+DELETE FROM ad_novedades
+WHERE id = @novedad_id;
+
+DELETE FROM ad_respaldos
+WHERE id = @backup_id;
+
+COMMIT;
